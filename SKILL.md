@@ -156,6 +156,35 @@ Drop the `_s3_` tables (now holding old-policy data) only after row counts and p
 DROP TABLE <db>._s3_<name>;
 ```
 
+### Step 9 — (Optional) OPTIMIZE FINAL
+
+After migration, tables have fragmented parts from the INSERT SELECT / ATTACH PARTITION process. Running `OPTIMIZE TABLE FINAL` merges them into a single part per partition, which improves query performance and reduces S3 API calls.
+
+**Run sequentially — never in parallel.** On a memory-constrained server (e.g. 6–8 GiB limit), running OPTIMIZE FINAL on multiple large tables simultaneously will OOM. One table at a time:
+
+```sql
+OPTIMIZE TABLE <db>.<name> FINAL
+```
+
+Use `&&`-chained CLI calls (each starts only after the previous finishes) rather than background jobs in parallel.
+
+**Monitoring cleanup:** After DROP (Step 8), old-policy parts are not removed instantly — the background cleaner runs on a schedule (`old_parts_lifetime`, default 8 min). To track progress:
+
+```sql
+-- Pending removal (active=0 = merged away, awaiting GC)
+SELECT database, count() AS parts, sum(rows) AS rows,
+       formatReadableSize(sum(data_compressed_bytes)) AS compressed
+FROM system.parts WHERE active = 0
+GROUP BY database ORDER BY sum(data_compressed_bytes) DESC
+
+-- Recent deletions (last minute)
+SELECT count() AS parts, formatReadableSize(sum(size_in_bytes)) AS size
+FROM system.part_log
+WHERE event_type = 'RemovePart' AND event_time >= now() - INTERVAL 1 MINUTE
+```
+
+When `active=0` parts reach 0 and `part_log` shows no recent RemovePart events, cleanup is complete.
+
 ## Safety rules
 
 - **Never drop a table** unless you have confirmed the other copy has equal row counts.
