@@ -10,7 +10,8 @@ Migrates all tables in a database to a new storage policy with zero downtime usi
 ## Tool conventions
 
 - **Read-only queries** (system.tables, system.parts, SELECT): use MCP `mcp__clickhouse__run_select_query`
-- **Write operations** (CREATE, INSERT, EXCHANGE, DROP): use Bash with:
+- **Write operations** (CREATE, INSERT, DROP): MCP works for these — the tool accepts any SQL, not just SELECT.
+- **EXCHANGE TABLES**: must use the CLI. The MCP user lacks the DROP TABLE privilege that EXCHANGE requires internally. Multi-statement queries (`;`-separated) are also not supported by MCP — run one statement per call.
   ```
   clickhouse client --connection prod-admin --max_execution_time=3600 --receive_timeout=3600 --send_timeout=3600
   ```
@@ -64,11 +65,11 @@ For each table `<name>`, check whether `_s3_<name>` already exists:
 
 ### Step 3 — Create shadow tables
 
-For tables that need it (Case A), derive `_s3_<name>` DDL:
+For tables that need it (Case A), derive `_s3_<name>` DDL from `SHOW CREATE TABLE <db>.<name>`:
 - Change the table name from `<db>.<name>` → `<db>._s3_<name>`
 - Replace `storage_policy = '<old>'` → `storage_policy = '<new>'`
 
-Batch all CREATEs in one `clickhouse client` call (multiple `;`-separated statements).
+**`LowCardinality(<non-String>)` columns:** If the source DDL contains `LowCardinality(UInt32)` or other non-String LowCardinality types, add `allow_suspicious_low_cardinality_types = 1` to the shadow's SETTINGS, otherwise ClickHouse rejects the CREATE.
 
 ### Step 4 — Copy data
 
@@ -78,7 +79,25 @@ INSERT sequentially, one table at a time (parallel inserts strain the server):
 INSERT INTO <db>._s3_<name> SELECT * FROM <db>.<name>
 ```
 
-Run each as a separate `clickhouse client` call for clear per-table signals. After each INSERT, immediately check row counts match before moving to the next table.
+Run each as a separate CLI call. After each INSERT, immediately check row counts match before moving to the next table.
+
+**If INSERT SELECT OOMs**, try two escalating fixes:
+
+1. **Reduce block size** — add `--max_block_size=5000` to the CLI call. This lowers per-block memory, often enough for moderately large tables.
+
+2. **If still OOM (often caused by projections)** — use `ATTACH PARTITION FROM` instead of INSERT SELECT. This copies parts server-side without loading data through query memory:
+   - First, add projection definitions to the shadow (without materializing) so both tables have matching projections:
+     ```sql
+     ALTER TABLE <db>._s3_<name> ADD PROJECTION <proj_name> (<proj_query>)
+     ```
+   - Drop any partial partitions from the shadow, then attach partition-by-partition:
+     ```sql
+     ALTER TABLE <db>._s3_<name> ATTACH PARTITION '<YYYYMM>' FROM <db>.<name>
+     ```
+   - Check which partitions exist via `system.parts` (group by `partition`) to know what to attach.
+   - `ATTACH PARTITION FROM` copies existing projection data from the source parts — no recomputation needed.
+
+**Live tables (ReplacingMergeTree etc.):** After INSERT SELECT completes, the source may have a few more rows from concurrent writes. A small diff (tens to hundreds of rows) is safe — the application will continue writing to the live table after EXCHANGE. Do not re-INSERT just for this.
 
 ### Step 5 — Verify row counts
 
